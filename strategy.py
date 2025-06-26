@@ -1,120 +1,121 @@
-"""
-This is a sample strategy that demonstrates how to implement a basic trading strategy
-that passes all validation requirements. This strategy is for educational purposes only
-and does not guarantee profitable trades. Users are encouraged to create their own
-strategies based on their trading knowledge and risk management principles.
-"""
-
 import pandas as pd
 import numpy as np
 
-
-
-
 def get_coin_metadata() -> dict:
-    """
-    Specifies the target and anchor coins used in this strategy.
-    
-    Returns:
-    {
-        "targets": [{"symbol": "LDO", "timeframe": "1H"}],
-        "anchors": [
-            {"symbol": "BTC", "timeframe": "4H"},
-            {"symbol": "ETH", "timeframe": "4H"}
-        ]
-    }
-    """
     return {
-        "targets": [{
-            "symbol": "LDO",
-            "timeframe": "1H"
-        }],
+        "targets": [
+            {"symbol": "LDO", "timeframe": "1H"},
+            {"symbol": "BONK", "timeframe": "1H"},
+            {"symbol": "DOGE", "timeframe": "1H"},
+        ],
         "anchors": [
             {"symbol": "BTC", "timeframe": "4H"},
-            {"symbol": "ETH", "timeframe": "4H"}
+            {"symbol": "ETH", "timeframe": "4H"},
+            {"symbol": "SOL", "timeframe": "4H"},
+            {"symbol": "BNB", "timeframe": "4H"},
+            {"symbol": "XRP", "timeframe": "4H"},
         ]
     }
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 def generate_signals(anchor_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Strategy: Buy LDO if BTC or ETH pumped >2% in the last 4H candle.
-    Enhanced with sell conditions and position sizing for complete trading pairs.
+    results = []
+    metadata = get_coin_metadata()
 
-    Inputs:
-    - anchor_df: DataFrame with timestamp, close_BTC_4H, close_ETH_4H columns
-    - target_df: DataFrame with timestamp, close_LDO_1H columns
+    anchors = [a["symbol"] for a in metadata["anchors"]]
+    targets = metadata["targets"]
 
-    Output:
-    - DataFrame with ['timestamp', 'symbol', 'signal', 'position_size']
-    """
-    try:
-        # Merge anchor and target data on timestamp
-        df = pd.merge(
-            target_df[['timestamp', 'close_LDO_1H']],
-            anchor_df[['timestamp', 'close_BTC_4H', 'close_ETH_4H']],
-            on='timestamp',
-            how='outer'  # Use outer join to get all timestamps
-        ).sort_values('timestamp').reset_index(drop=True)
-        
-        # Calculate 4H returns for BTC and ETH
-        df['btc_return_4h'] = df['close_BTC_4H'].pct_change(fill_method=None)
-        df['eth_return_4h'] = df['close_ETH_4H'].pct_change(fill_method=None)
-        
-        # Calculate LDO price change for sell signals
-        df['ldo_return_1h'] = df['close_LDO_1H'].pct_change(fill_method=None)
-        
-        # Initialize signal arrays
-        signals = []
-        position_sizes = []
-        
-        # Track position state for generating buy-sell pairs
+    for target in targets:
+        symbol = target["symbol"]
+        tf = target["timeframe"]
+        close_col = f"close_{symbol}_{tf}"
+        if close_col not in target_df:
+            continue
+
+        df = target_df[["timestamp", close_col]].copy()
+        df.rename(columns={close_col: "close"}, inplace=True)
+        df["ema200"] = df["close"].ewm(span=200).mean()
+        df["rsi"] = calculate_rsi(df["close"])
+        df["return"] = df["close"].pct_change()
+        df["volatility"] = df["return"].rolling(10).std().fillna(0.01)
+        df["signal"] = "HOLD"
+        df["position_size"] = 0.0
+
+        # Add anchor returns
+        for a in anchors:
+            col = f"close_{a}_4H"
+            if col in anchor_df:
+                df[f"{a}_ret"] = anchor_df[col].pct_change().fillna(0)
+
         in_position = False
         entry_price = 0
-        
+        cooldown = 0
+
+        signals = []
+        sizes = []
+
         for i in range(len(df)):
-            # Get current values (handle NaN)
-            btc_pump = df['btc_return_4h'].iloc[i] > 0.02 if pd.notna(df['btc_return_4h'].iloc[i]) else False
-            eth_pump = df['eth_return_4h'].iloc[i] > 0.02 if pd.notna(df['eth_return_4h'].iloc[i]) else False
-            ldo_price = df['close_LDO_1H'].iloc[i]
-            
-            # Signal generation logic
-            if not in_position:
-                # Look for buy signals
-                if (btc_pump or eth_pump) and pd.notna(ldo_price):
-                    signals.append('BUY')
-                    position_sizes.append(0.5)  # 50% position size
-                    in_position = True
-                    entry_price = ldo_price
+            row = df.iloc[i]
+
+            # Anchor score: how many anchors pumped >2%
+            anchor_pumps = sum([
+                row.get(f"{a}_ret", 0) > 0.02 for a in anchors
+            ])
+
+            trend_ok = row["close"] > row["ema200"]
+            rsi_ok = row["rsi"] > 50
+            price = row["close"]
+            vol = row["volatility"]
+
+            # Cooldown logic
+            if cooldown > 0:
+                cooldown -= 1
+                signals.append("HOLD")
+                sizes.append(0.0)
+                continue
+
+            # Entry condition
+            if not in_position and price > 0 and trend_ok and rsi_ok and anchor_pumps >= 3:
+                signals.append("BUY")
+                sizes.append(min(1.0, max(0.2, 0.05 / (vol + 1e-9))))
+                in_position = True
+                entry_price = price
+                continue
+
+            # Exit condition
+            if in_position and price > 0 and entry_price > 0:
+                change = (price - entry_price) / entry_price
+                if change > 0.05 or change < -0.03:
+                    signals.append("SELL")
+                    sizes.append(0.0)
+                    in_position = False
+                    entry_price = 0
+                    cooldown = 20  # wait 20 candles
+                    continue
                 else:
-                    signals.append('HOLD')
-                    position_sizes.append(0.0)
-            else:
-                # Look for sell signals when in position
-                if pd.notna(ldo_price) and entry_price > 0:
-                    # Sell conditions: 5% profit or 3% loss
-                    profit_pct = (ldo_price - entry_price) / entry_price
-                    
-                    if profit_pct >= 0.05 or profit_pct <= -0.03:
-                        signals.append('SELL')
-                        position_sizes.append(0.0)
-                        in_position = False
-                        entry_price = 0
-                    else:
-                        signals.append('HOLD')
-                        position_sizes.append(0.5)  # Maintain position
-                else:
-                    signals.append('HOLD')
-                    position_sizes.append(0.5 if in_position else 0.0)
-        
-        # Create result DataFrame with required columns
-        result_df = pd.DataFrame({
-            'timestamp': df['timestamp'],
-            'symbol': 'LDO',  # All signals are for LDO (the target)
-            'signal': signals,
-            'position_size': position_sizes
+                    signals.append("HOLD")
+                    sizes.append(min(1.0, max(0.2, 0.05 / (vol + 1e-9))))
+                    continue
+
+            # Default
+            signals.append("HOLD")
+            sizes.append(0.0)
+
+        result = pd.DataFrame({
+            "timestamp": df["timestamp"],
+            "symbol": symbol,
+            "signal": signals,
+            "position_size": sizes
         })
-        
-        return result_df
-        
-    except Exception as e:
-        raise RuntimeError(f"Error in generate_signals: {e}")
+
+        results.append(result)
+
+    return pd.concat(results, ignore_index=True)
